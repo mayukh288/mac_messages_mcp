@@ -3,11 +3,15 @@
 Mac Messages MCP - Entry point fixed for proper MCP protocol implementation
 """
 
-import asyncio
 import logging
 import sys
 
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
+from starlette.applications import Starlette
+from starlette.routing import Mount, Route
+from starlette.responses import JSONResponse, StreamingResponse
+from starlette.requests import Request
+from starlette.middleware.cors import CORSMiddleware
 
 from mac_messages_mcp.messages import (
     _check_imessage_availability,
@@ -23,15 +27,20 @@ from mac_messages_mcp.messages import (
 
 # Configure logging to stderr for debugging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s:%(lineno)d] %(message)s',
     stream=sys.stderr
 )
 
 logger = logging.getLogger("mac_messages_mcp")
 
 # Initialize the MCP server
-mcp = FastMCP("MessageBridge", description="A bridge for interacting with macOS Messages app")
+logger.debug("Initializing FastMCP server...")
+mcp = FastMCP("MessageBridge")
+logger.debug("FastMCP server initialized successfully")
+
+# Global cache for tools to avoid repeated async calls
+_cached_tools = None
 
 @mcp.tool()
 def tool_get_recent_messages(ctx: Context, hours: int = 24, contact: str = None) -> str:
@@ -43,7 +52,8 @@ def tool_get_recent_messages(ctx: Context, hours: int = 24, contact: str = None)
         contact: Filter by contact name, phone number, or email (optional)
                 Use "contact:N" to select a specific contact from previous matches
     """
-    logger.info(f"Getting recent messages: hours={hours}, contact={contact}")
+    logger.info(f"[TOOL] Getting recent messages: hours={hours}, contact={contact}")
+    logger.debug(f"Calling get_recent_messages with hours={hours}, contact={contact}")
     try:
         # Handle contacts that are passed as numbers
         if contact is not None:
@@ -66,7 +76,8 @@ def tool_send_message(ctx: Context, recipient: str, message: str, group_chat: bo
         message: Message text to send
         group_chat: Set to True when sending to a group chat. Uses the chat ID directly without contact lookup.
     """
-    logger.info(f"Sending message to: {recipient}, group_chat: {group_chat}")
+    logger.info(f"[TOOL] Sending message to: {recipient}, group_chat: {group_chat}")
+    logger.debug(f"Message content length: {len(message)}")
     try:
         # Ensure recipient is a string (handles numbers properly)
         recipient = str(recipient)
@@ -84,7 +95,8 @@ def tool_find_contact(ctx: Context, name: str) -> str:
     Args:
         name: The name to search for
     """
-    logger.info(f"Finding contact: {name}")
+    logger.info(f"[TOOL] Finding contact: {name}")
+    logger.debug(f"Starting contact lookup for: {name}")
     try:
         matches = find_contact_by_name(name)
         
@@ -259,13 +271,284 @@ def get_contact_messages_resource(contact: str, hours: int = 24) -> str:
     """Resource that provides messages from a specific contact."""
     return get_recent_messages(hours=hours, contact=contact)
 
+
+def _preload_tools() -> None:
+    """Pre-load tools once at startup for compatibility endpoints."""
+    logger.debug("Pre-loading tool list for caching (max 100ms)...")
+
+    global _cached_tools
+
+    import asyncio
+    import concurrent.futures
+
+    def load_tools():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(mcp.list_tools())
+            finally:
+                loop.close()
+        except Exception as exc:
+            logger.warning(f"Could not pre-load tools: {exc}")
+            return []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(load_tools)
+        try:
+            _cached_tools = future.result(timeout=0.1)
+            logger.debug(f"Successfully cached {len(_cached_tools)} tools in <100ms")
+        except concurrent.futures.TimeoutError:
+            logger.warning("Tool list preload timed out (>100ms), using empty cache")
+            _cached_tools = []
+        except Exception as exc:
+            logger.warning(f"Tool list preload error: {exc}")
+            _cached_tools = []
+
+
+async def tools_list_compat(request: Request):
+    """Handle tools/list requests without requiring MCP session for compatibility."""
+    logger.debug("Serving tools/list via compatibility endpoint")
+
+    try:
+        if _cached_tools is None:
+            logger.warning("Tool cache not initialized")
+            tool_list = []
+        else:
+            tool_list = [
+                {
+                    "name": tool.name,
+                    "description": tool.description.strip(),
+                    "inputSchema": tool.inputSchema,
+                }
+                for tool in _cached_tools
+            ]
+
+        response_data = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": tool_list},
+        }
+
+        async def generate_sse():
+            import json
+
+            json_str = json.dumps(response_data, separators=(",", ":"))
+            yield f"event: message\ndata: {json_str}\n\n"
+
+        return StreamingResponse(
+            generate_sse(),
+            media_type="text/event-stream",
+            headers={
+                "mcp-session-id": f"compat-{id(request)}",
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    except Exception as exc:
+        logger.error(f"Error in compatibility tools/list: {exc}")
+        error_response = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32603, "message": "Internal error"},
+        }
+
+        async def generate_error():
+            import json
+
+            yield f"event: message\ndata: {json.dumps(error_response)}\n\n"
+
+        return StreamingResponse(
+            generate_error(),
+            media_type="text/event-stream",
+            status_code=500,
+            headers={"mcp-session-id": f"error-{id(request)}"},
+        )
+
+
+async def root_handler(request: Request):
+    """Handle compatibility requests sent to the root path by browser extensions."""
+    origin = request.headers.get("origin", "")
+
+    if origin.startswith("chrome-extension://"):
+        try:
+            body = await request.body()
+            import json
+
+            request_data = json.loads(body.decode("utf-8"))
+            method = request_data.get("method")
+
+            if method == "initialize":
+                logger.debug("Browser extension initialize request, returning server info")
+                init_response = {
+                    "jsonrpc": "2.0",
+                    "id": request_data.get("id", 1),
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {"listChanged": False}},
+                        "serverInfo": {
+                            "name": "mac-messages-mcp",
+                            "version": "1.0.0",
+                        },
+                    },
+                }
+
+                async def generate_init():
+                    yield f"event: message\ndata: {json.dumps(init_response)}\n\n"
+
+                return StreamingResponse(
+                    generate_init(),
+                    media_type="text/event-stream",
+                    headers={
+                        "mcp-session-id": f"init-{id(request)}",
+                        "Cache-Control": "no-cache, no-transform",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+
+            if method == "tools/list":
+                logger.debug("Browser extension tools/list request, redirecting to compatibility endpoint")
+                return await tools_list_compat(request)
+
+            logger.debug(f"Browser extension {method} request - not supported, returning SSE error")
+            error_response = {
+                "jsonrpc": "2.0",
+                "id": request_data.get("id", 1),
+                "error": {
+                    "code": -32601,
+                    "message": f"Method '{method}' not supported by compatibility endpoint",
+                },
+            }
+
+            async def generate_error():
+                yield f"event: message\ndata: {json.dumps(error_response)}\n\n"
+
+            return StreamingResponse(
+                generate_error(),
+                media_type="text/event-stream",
+                status_code=200,
+                headers={
+                    "mcp-session-id": f"error-{id(request)}",
+                    "Cache-Control": "no-cache, no-transform",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        except Exception as exc:
+            logger.debug(f"Could not parse request body: {exc}")
+            error_response = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32700, "message": "Parse error"},
+            }
+
+            async def generate_parse_error():
+                import json
+
+                yield f"event: message\ndata: {json.dumps(error_response)}\n\n"
+
+            return StreamingResponse(
+                generate_parse_error(),
+                media_type="text/event-stream",
+                status_code=200,
+                headers={
+                    "mcp-session-id": f"parse-error-{id(request)}",
+                    "Cache-Control": "no-cache, no-transform",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+    return JSONResponse({"error": "Not found"}, status_code=404)
+
+
+def create_http_app() -> Starlette:
+    """Build the HTTP app with FastMCP-managed lifespan and compatibility routes."""
+    _preload_tools()
+
+    managed_mcp_app = mcp.http_app(path="/mcp", transport="streamable-http")
+
+    starlette_app = Starlette(
+        routes=[
+            Route("/tools-list-compat", tools_list_compat, methods=["POST"]),
+            Route("/", root_handler, methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]),
+            Mount("/", app=managed_mcp_app),
+        ],
+        lifespan=managed_mcp_app.lifespan,
+    )
+
+    return CORSMiddleware(
+        starlette_app,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
 def run_server():
     """Run the MCP server with proper error handling"""
     try:
+        logger.info("=" * 60)
         logger.info("Starting Mac Messages MCP server...")
-        mcp.run()
+        logger.info("=" * 60)
+        logger.info("Server configuration:")
+        logger.info("  - Server name: MessageBridge")
+        logger.info("  - Transport: streamable-http (HTTP server)")
+        logger.info("  - Host: 0.0.0.0 (accessible from browser extensions)")
+        logger.info("  - Port: 8001")
+        logger.info("  - Protocol: MCP (Model Context Protocol)")
+        logger.info("  - Logging level: DEBUG")
+        logger.info("  - CORS: Enabled for browser access")
+        logger.debug("Available tools registered: 9 tools")
+        logger.debug("  - tool_get_recent_messages")
+        logger.debug("  - tool_send_message")
+        logger.debug("  - tool_find_contact")
+        logger.debug("  - tool_check_db_access")
+        logger.debug("  - tool_check_contacts")
+        logger.debug("  - tool_check_addressbook")
+        logger.debug("  - tool_get_chats")
+        logger.debug("  - tool_check_imessage_availability")
+        logger.debug("  - tool_fuzzy_search_messages")
+        logger.info("Attempting to start HTTP server using streamable-http transport...")
+        
+        try:
+            import uvicorn
+            logger.debug("Creating lifecycle-managed HTTP app from FastMCP...")
+            asgi_app = create_http_app()
+            
+            logger.info("✓ Server initialized and ready")
+            logger.info("=" * 60)
+            logger.info(f"🚀 Mac Messages MCP server is running!")
+            logger.info(f"   📡 Listening on: http://0.0.0.0:8001")
+            logger.info(f"   🌐 For browser extension, use: http://localhost:8001")
+            logger.info(f"   Protocol: MCP over HTTP (streamable-http)")
+            logger.info(f"   CORS: Enabled for cross-origin requests")
+            logger.info(f"   Debug: All requests will be logged to console")
+            logger.info("=" * 60)
+            
+            # Run the ASGI server on port 8001, bound to all interfaces
+            logger.debug("Starting uvicorn with CORS-enabled ASGI app on 0.0.0.0:8001...")
+            logger.info("Waiting for connections from browser extension...")
+            uvicorn.run(
+                asgi_app, 
+                host="0.0.0.0", 
+                port=8001, 
+                log_level="info"
+            )
+        except Exception as e:
+            logger.error(f"Failed to start HTTP server: {str(e)}", exc_info=True)
+            logger.info("Falling back to stdio mode (standard MCP protocol)...")
+            logger.debug("Using mcp.run('stdio') for stdio mode")
+            logger.info("Server running in stdio mode (for direct process communication)")
+            mcp.run(transport='stdio')
+            
+    except KeyboardInterrupt:
+        logger.info("Server shutdown requested by user")
+        sys.exit(0)
     except Exception as e:
-        logger.error(f"Failed to start server: {str(e)}")
+        logger.error(f"Fatal server error: {str(e)}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":

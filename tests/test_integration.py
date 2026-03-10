@@ -5,6 +5,8 @@ Tests all MCP tools to ensure they don't crash and handle edge cases properly
 import os
 import sys
 
+from starlette.testclient import TestClient
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from mac_messages_mcp.messages import (
@@ -16,6 +18,7 @@ from mac_messages_mcp.messages import (
     fuzzy_search_messages,
     get_recent_messages,
 )
+from mac_messages_mcp.server import create_http_app
 
 
 def test_import_fixes():
@@ -176,6 +179,28 @@ def test_sms_fallback_functionality():
     return True
 
 
+def test_http_transport_initializes_lifespan():
+    """Test that the HTTP MCP endpoint no longer crashes on first request."""
+    app = create_http_app()
+
+    initialize_request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "test-client", "version": "1.0.0"},
+        },
+    }
+
+    with TestClient(app) as client:
+        response = client.post("/mcp", json=initialize_request)
+
+    assert response.status_code != 500
+    assert "Task group is not initialized" not in response.text
+
+
 def run_all_tests():
     """Run all tests and report results"""
     print("🚀 Running Mac Messages MCP Integration Tests")
@@ -188,6 +213,7 @@ def run_all_tests():
         test_no_crashes,
         test_time_ranges,
         test_sms_fallback_functionality,
+        test_http_transport_initializes_lifespan,
     ]
     
     passed = 0

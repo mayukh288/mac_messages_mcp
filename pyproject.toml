@@ -25,7 +25,8 @@ classifiers = [
 dependencies = [
     "mcp[cli]", # For FastMCP functionality with CLI support
     "thefuzz>=0.20.0",
-    "python-Levenshtein>=0.23.0", # Optional but recommended for performance
+    "python-levenshtein>=0.23.0", # Optional but recommended for performance
+    "fastmcp>=3.1.0",
 ]
 
 [project.urls]
