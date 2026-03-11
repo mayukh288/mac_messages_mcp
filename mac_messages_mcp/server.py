@@ -9,7 +9,7 @@ import sys
 from fastmcp import Context, FastMCP
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.requests import Request
 from starlette.middleware.cors import CORSMiddleware
 
@@ -43,7 +43,13 @@ logger.debug("FastMCP server initialized successfully")
 _cached_tools = None
 
 @mcp.tool()
-def tool_get_recent_messages(ctx: Context, hours: int = 24, contact: str = None) -> str:
+def tool_get_recent_messages(
+    ctx: Context,
+    hours: int = 24,
+    contact: str = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> str:
     """
     Get recent messages from the Messages app.
     
@@ -51,14 +57,27 @@ def tool_get_recent_messages(ctx: Context, hours: int = 24, contact: str = None)
         hours: Number of hours to look back (default: 24)
         contact: Filter by contact name, phone number, or email (optional)
                 Use "contact:N" to select a specific contact from previous matches
+        limit: Maximum number of messages to return (default: 100)
+        offset: Number of matching messages to skip before returning results
     """
-    logger.info(f"[TOOL] Getting recent messages: hours={hours}, contact={contact}")
-    logger.debug(f"Calling get_recent_messages with hours={hours}, contact={contact}")
+    logger.info(
+        f"[TOOL] Getting recent messages: hours={hours}, contact={contact}, "
+        f"limit={limit}, offset={offset}"
+    )
+    logger.debug(
+        f"Calling get_recent_messages with hours={hours}, contact={contact}, "
+        f"limit={limit}, offset={offset}"
+    )
     try:
         # Handle contacts that are passed as numbers
         if contact is not None:
             contact = str(contact)
-        result = get_recent_messages(hours=hours, contact=contact)
+        result = get_recent_messages(
+            hours=hours,
+            contact=contact,
+            limit=limit,
+            offset=offset,
+        )
         return result
     except Exception as e:
         logger.error(f"Error in get_recent_messages: {str(e)}")
@@ -306,7 +325,25 @@ def _preload_tools() -> None:
             _cached_tools = []
 
 
-async def tools_list_compat(request: Request):
+def _serialize_cached_tool(tool) -> dict:
+    """Normalize FastMCP tool metadata into MCP tool-list response shape."""
+    description = (getattr(tool, "description", "") or "").strip()
+    input_schema = getattr(tool, "inputSchema", None)
+
+    if input_schema is None:
+        input_schema = getattr(tool, "parameters", None)
+
+    if input_schema is None:
+        input_schema = {"type": "object", "properties": {}}
+
+    return {
+        "name": tool.name,
+        "description": description,
+        "inputSchema": input_schema,
+    }
+
+
+async def tools_list_compat(request: Request, request_id: int = 1):
     """Handle tools/list requests without requiring MCP session for compatibility."""
     logger.debug("Serving tools/list via compatibility endpoint")
 
@@ -315,18 +352,11 @@ async def tools_list_compat(request: Request):
             logger.warning("Tool cache not initialized")
             tool_list = []
         else:
-            tool_list = [
-                {
-                    "name": tool.name,
-                    "description": tool.description.strip(),
-                    "inputSchema": tool.inputSchema,
-                }
-                for tool in _cached_tools
-            ]
+            tool_list = [_serialize_cached_tool(tool) for tool in _cached_tools]
 
         response_data = {
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": request_id,
             "result": {"tools": tool_list},
         }
 
@@ -350,7 +380,7 @@ async def tools_list_compat(request: Request):
         logger.error(f"Error in compatibility tools/list: {exc}")
         error_response = {
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": request_id,
             "error": {"code": -32603, "message": "Internal error"},
         }
 
@@ -378,12 +408,13 @@ async def root_handler(request: Request):
 
             request_data = json.loads(body.decode("utf-8"))
             method = request_data.get("method")
+            request_id = request_data.get("id", 1)
 
             if method == "initialize":
                 logger.debug("Browser extension initialize request, returning server info")
                 init_response = {
                     "jsonrpc": "2.0",
-                    "id": request_data.get("id", 1),
+                    "id": request_id,
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {"listChanged": False}},
@@ -410,12 +441,16 @@ async def root_handler(request: Request):
 
             if method == "tools/list":
                 logger.debug("Browser extension tools/list request, redirecting to compatibility endpoint")
-                return await tools_list_compat(request)
+                return await tools_list_compat(request, request_id=request_id)
+
+            if method.startswith("notifications/"):
+                logger.debug(f"Browser extension {method} notification received")
+                return Response(status_code=202)
 
             logger.debug(f"Browser extension {method} request - not supported, returning SSE error")
             error_response = {
                 "jsonrpc": "2.0",
-                "id": request_data.get("id", 1),
+                "id": request_id,
                 "error": {
                     "code": -32601,
                     "message": f"Method '{method}' not supported by compatibility endpoint",

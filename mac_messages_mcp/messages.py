@@ -649,7 +649,12 @@ def get_contact_name(handle_id: int) -> str:
     # If no contact name found, return the phone number or email
     return handle_id_value
 
-def get_recent_messages(hours: int = 24, contact: Optional[str] = None) -> str:
+def get_recent_messages(
+    hours: int = 24,
+    contact: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> str:
     """
     Get recent messages from the Messages app using attributedBody for content.
     
@@ -657,6 +662,8 @@ def get_recent_messages(hours: int = 24, contact: Optional[str] = None) -> str:
         hours: Number of hours to look back (default: 24)
         contact: Filter by contact name, phone number, or email (optional)
                 Use "contact:N" to select a specific contact from previous matches
+        limit: Maximum number of messages to return (default: 100)
+        offset: Number of matching messages to skip before returning results
     
     Returns:
         Formatted string with recent messages
@@ -669,6 +676,16 @@ def get_recent_messages(hours: int = 24, contact: Optional[str] = None) -> str:
     MAX_HOURS = 10 * 365 * 24  # 87,600 hours
     if hours > MAX_HOURS:
         return f"Error: Hours value too large. Maximum allowed is {MAX_HOURS} hours (10 years)."
+
+    if limit <= 0:
+        return "Error: Limit must be a positive integer."
+
+    if offset < 0:
+        return "Error: Offset cannot be negative."
+
+    MAX_LIMIT = 5000
+    if limit > MAX_LIMIT:
+        return f"Error: Limit too large. Maximum allowed is {MAX_LIMIT}."
     
     handle_ids = None
     
@@ -797,7 +814,8 @@ def get_recent_messages(hours: int = 24, contact: Optional[str] = None) -> str:
         query += f"AND m.handle_id IN ({placeholders}) "
         params.extend(handle_ids)
     
-    query += "ORDER BY m.date DESC LIMIT 100"
+    query += "ORDER BY m.date DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
     
     # Execute the query
     messages = query_messages_db(query, tuple(params))
