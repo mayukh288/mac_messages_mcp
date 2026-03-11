@@ -348,9 +348,9 @@ def _serialize_tool_result_content(content_items) -> list:
     serialized = []
     for item in content_items:
         if hasattr(item, "model_dump"):
-            serialized.append(item.model_dump())
+            serialized.append(item.model_dump(exclude_none=True))
         elif isinstance(item, dict):
-            serialized.append(item)
+            serialized.append({k: v for k, v in item.items() if v is not None})
         else:
             serialized.append({"type": "text", "text": str(item)})
     return serialized
