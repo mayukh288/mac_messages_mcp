@@ -343,6 +343,19 @@ def _serialize_cached_tool(tool) -> dict:
     }
 
 
+def _serialize_tool_result_content(content_items) -> list:
+    """Convert FastMCP content objects into JSON-serializable MCP content items."""
+    serialized = []
+    for item in content_items:
+        if hasattr(item, "model_dump"):
+            serialized.append(item.model_dump())
+        elif isinstance(item, dict):
+            serialized.append(item)
+        else:
+            serialized.append({"type": "text", "text": str(item)})
+    return serialized
+
+
 async def tools_list_compat(request: Request, request_id: int = 1):
     """Handle tools/list requests without requiring MCP session for compatibility."""
     logger.debug("Serving tools/list via compatibility endpoint")
@@ -442,6 +455,91 @@ async def root_handler(request: Request):
             if method == "tools/list":
                 logger.debug("Browser extension tools/list request, redirecting to compatibility endpoint")
                 return await tools_list_compat(request, request_id=request_id)
+
+            if method == "tools/call":
+                logger.debug("Browser extension tools/call request via compatibility endpoint")
+                params = request_data.get("params", {}) or {}
+                tool_name = params.get("name")
+                tool_arguments = params.get("arguments", {}) or {}
+
+                if not tool_name:
+                    error_response = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": -32602,
+                            "message": "Invalid params: tools/call requires 'name'",
+                        },
+                    }
+
+                    async def generate_invalid_params():
+                        yield f"event: message\ndata: {json.dumps(error_response)}\n\n"
+
+                    return StreamingResponse(
+                        generate_invalid_params(),
+                        media_type="text/event-stream",
+                        status_code=200,
+                        headers={
+                            "mcp-session-id": f"error-{id(request)}",
+                            "Cache-Control": "no-cache, no-transform",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
+
+                try:
+                    tool_result = await mcp.call_tool(tool_name, tool_arguments)
+                    content, structured_content = tool_result.to_mcp_result()
+
+                    result_response = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "content": _serialize_tool_result_content(content),
+                            "structuredContent": structured_content,
+                            "isError": False,
+                        },
+                    }
+
+                    async def generate_tool_result():
+                        yield f"event: message\ndata: {json.dumps(result_response)}\n\n"
+
+                    return StreamingResponse(
+                        generate_tool_result(),
+                        media_type="text/event-stream",
+                        status_code=200,
+                        headers={
+                            "mcp-session-id": f"compat-{id(request)}",
+                            "Cache-Control": "no-cache, no-transform",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
+                except Exception as exc:
+                    logger.error(f"Error in compatibility tools/call: {exc}")
+                    error_response = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": -32603,
+                            "message": f"Tool execution failed: {str(exc)}",
+                        },
+                    }
+
+                    async def generate_tool_error():
+                        yield f"event: message\ndata: {json.dumps(error_response)}\n\n"
+
+                    return StreamingResponse(
+                        generate_tool_error(),
+                        media_type="text/event-stream",
+                        status_code=200,
+                        headers={
+                            "mcp-session-id": f"error-{id(request)}",
+                            "Cache-Control": "no-cache, no-transform",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
 
             if method.startswith("notifications/"):
                 logger.debug(f"Browser extension {method} notification received")
